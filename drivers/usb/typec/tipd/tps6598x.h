@@ -368,6 +368,8 @@ struct cd321x {
 	struct typec_mux *mux;
 	struct typec_mux_state state;
 
+	struct typec_thunderbolt_switch *tbt_switch;
+
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
 	struct usb_pd_identity cur_partner_identity;
