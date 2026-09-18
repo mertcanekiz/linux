@@ -361,7 +361,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	int ret = 0;
 
-	if (!dcp->phy) {
+	if (!dcp->phy && !dcp->dp_tunnel) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
 	}
@@ -377,32 +377,63 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	if (dcp->dptxport[port].connected)
 		goto out_unlock;
 
+	if (dcp->dp_tunnel) {
+		ret = mux_control_select(dcp->xbar, dcp->tunnel_mux_index);
+		if (ret)
+			goto out_unlock;
+		dcp->tunnel_mux_selected = true;
+		ret = dptxport_validate_connection(dcp->dptxport[port].service,
+				dcp->dptx_core, dcp->dptx_phy, dcp->dptx_die);
+		dev_info(dcp->dev, "DP tunnel validate core=%u ATC=%u die=%u: %d\n",
+			 dcp->dptx_core, dcp->dptx_phy, dcp->dptx_die, ret);
+		if (ret)
+			goto out_mux;
+	}
+
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
-	dptxport_connect(dcp->dptxport[port].service, 0, dcp->dptx_phy, dcp->dptx_die);
-	dptxport_request_display(dcp->dptxport[port].service);
+	ret = dptxport_connect(dcp->dptxport[port].service, dcp->dptx_core,
+			       dcp->dptx_phy, dcp->dptx_die);
+	if (ret) {
+		dev_err(dcp->dev, "DPTX connect failed: %d\n", ret);
+		goto out_mux;
+	}
+	ret = dptxport_request_display(dcp->dptxport[port].service);
+	if (ret) {
+		dev_err(dcp->dev, "DPTX display request failed: %d\n", ret);
+		goto out_mux;
+	}
 	dcp->dptxport[port].connected = true;
 
 	mutex_unlock(&dcp->hpd_mutex);
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 				    DPTX_CONNECT_TIMEOUT);
-	if (ret < 0)
-		dev_warn(dcp->dev, "dcp_dptx_connect: port %d link complete failed:%d\n",
-			 port, ret);
+	if (!ret)
+		dev_warn(dcp->dev, "dcp_dptx_connect: port %d link configuration timed out\n",
+			 port);
 	else
 		dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
 			jiffies_to_msecs(DPTX_CONNECT_TIMEOUT - ret));
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort)
-		dptxport_set_hpd(dcp->dptxport[port].service, true);
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		dev_info(dcp->dev, "DPTX HPD assert: %d\n", ret);
+		if (ret)
+			return ret;
+	}
 
 	if (dcp->avep)
 		av_service_connect(dcp);
 
 	return 0;
 
+out_mux:
+	if (dcp->tunnel_mux_selected) {
+		mux_control_deselect(dcp->xbar);
+		dcp->tunnel_mux_selected = false;
+	}
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
@@ -418,16 +449,64 @@ static void disconnected_hpd_event(struct apple_connector *con)
 
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 {
+	int ret = 0;
+
 	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
 
 	mutex_lock(&dcp->hpd_mutex);
 	if (dcp->dptxport[port].enabled && dcp->dptxport[port].connected) {
-		dptxport_release_display(dcp->dptxport[port].service);
+		ret = dptxport_release_display(dcp->dptxport[port].service);
+		if (ret)
+			goto out_unlock;
 		dcp->dptxport[port].connected = false;
 	}
+	if (dcp->tunnel_mux_selected) {
+		ret = mux_control_deselect(dcp->xbar);
+		dcp->tunnel_mux_selected = false;
+	}
+out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
 
-	return 0;
+	return ret;
+}
+
+/*
+ * DP-IN bring-up: choose which CIO DP IN adapter (0 or 1) the external
+ * display controller is routed to. Only allowed while disconnected.
+ */
+int dcp_dptx_tunnel_select_dpin(struct platform_device *pdev, u32 dpin)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	int ret = 0;
+
+	if (!dcp->dp_tunnel || dpin > 1)
+		return -EINVAL;
+	if (!dcp->xbar_dpin[dpin])
+		return -ENODEV;
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (dcp->dptxport[0].connected || dcp->tunnel_mux_selected) {
+		ret = -EBUSY;
+		goto out;
+	}
+	dcp->tunnel_dpin = dpin;
+	dcp->xbar = dcp->xbar_dpin[dpin];
+	/* m1n1 dcpav.py: DPPHY=0, DPIN0=1, DPIN1=2. */
+	dcp->dptx_core = dpin + 1;
+	dev_info(dcp->dev, "DP-IN route selected: dpin%u (dptx core %u)\n",
+		 dpin, dcp->dptx_core);
+out:
+	mutex_unlock(&dcp->hpd_mutex);
+	return ret;
+}
+
+int dcp_dptx_tunnel_get_dpin(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (!dcp->dp_tunnel)
+		return -EINVAL;
+	return dcp->tunnel_dpin;
 }
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
@@ -519,7 +598,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+	if ((dcp->phy || dcp->dp_tunnel) && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
@@ -553,7 +632,7 @@ int dcp_start(struct platform_device *pdev)
 				dcp_dptx_connect(dcp, 0);
 #endif
 		}
-	} else if (dcp->phy) {
+	} else if (dcp->phy || dcp->dp_tunnel) {
 		dev_warn(dcp->dev, "OS firmware incompatible with dptxport EP\n");
 	}
 	ret = iomfb_start_rtkit(dcp);
@@ -748,8 +827,9 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 	}
 
 	dcp->iommu_dom = iommu_get_domain_for_dev(&dcp->piodma->dev);
-	if (IS_ERR(dcp->iommu_dom)) {
-		ret = dev_err_probe(dcp->dev, PTR_ERR(dcp->iommu_dom),
+	if (IS_ERR_OR_NULL(dcp->iommu_dom)) {
+		ret = dev_err_probe(dcp->dev,
+				    dcp->iommu_dom ? PTR_ERR(dcp->iommu_dom) : -ENODEV,
 				    "Failed to get default iommu domain for "
 				    "piodma device\n");
 		dcp->iommu_dom = NULL;
@@ -759,6 +839,7 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 	return 0;
 err_destroy_pdev:
 	of_platform_device_destroy(&dcp->piodma->dev, NULL);
+	dcp->piodma = NULL;
 	return ret;
 }
 
@@ -1044,9 +1125,9 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dcp->connector_type = DRM_MODE_CONNECTOR_Unknown;
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
-	if (ret || !dcp->iommu_dom)
+	if (ret)
 		return dev_err_probe(dev, ret,
-				"Failed to created PIODMA iommu child device");
+				"Failed to create PIODMA iommu child device\n");
 
 	ret = dcp_get_disp_regs(dcp);
 	if (ret) {
@@ -1182,11 +1263,43 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dcp);
 
+	dcp->dp_tunnel = of_property_read_bool(dev->of_node, "apple,tbt-dpin-test");
+	if (dcp->dp_tunnel) {
+		int ret;
+
+		/* m1n1 dcpav.py: DPPHY=0, DPIN0=1, DPIN1=2. */
+		ret = of_property_read_u32(dev->of_node, "apple,dptx-core", &dcp->dptx_core);
+		if (ret || dcp->dptx_core < 1 || dcp->dptx_core > 2)
+			return -EINVAL;
+		ret = of_property_read_u32(dev->of_node, "mux-index", &dcp->tunnel_mux_index);
+		if (ret)
+			return ret;
+		/* "dp-xbar" is the DP IN 0 control, "dp-xbar-dpin1" the optional DP IN 1 one. */
+		dcp->xbar_dpin[0] = devm_mux_control_get(dev, "dp-xbar");
+		if (IS_ERR(dcp->xbar_dpin[0]))
+			return dev_err_probe(dev, PTR_ERR(dcp->xbar_dpin[0]), "DP-IN crossbar unavailable\n");
+		dcp->xbar_dpin[1] = devm_mux_control_get(dev, "dp-xbar-dpin1");
+		if (IS_ERR(dcp->xbar_dpin[1])) {
+			dev_warn(dev, "DP-IN 1 crossbar control unavailable: %ld\n",
+				 PTR_ERR(dcp->xbar_dpin[1]));
+			dcp->xbar_dpin[1] = NULL;
+		}
+		dcp->tunnel_dpin = dcp->dptx_core - 1;
+		dcp->xbar = dcp->xbar_dpin[dcp->tunnel_dpin];
+		if (!dcp->xbar)
+			return dev_err_probe(dev, -ENODEV, "DP-IN %u crossbar control missing\n",
+					     dcp->tunnel_dpin);
+		dev_warn(dev, "Experimental DP-IN route; connect manually through tunnel_hpd debugfs\n");
+	}
+
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");
 	if (IS_ERR(dcp->phy)) {
 		dev_err(dev, "Failed to get dp-phy: %ld\n", PTR_ERR(dcp->phy));
 		return PTR_ERR(dcp->phy);
 	}
+	if (dcp->dp_tunnel)
+		dev_info(dev, "DP-IN route %s the Type-C PHY for DP clock setup\n",
+			 dcp->phy ? "uses" : "has no PHY;");
 
 	bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 	if (!of_property_present(dev->of_node, "apple,iomfb-surfaces"))
@@ -1214,7 +1327,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		surf++;
 	}
 
-	if (dcp->phy) {
+	/* The DP-altmode/DP2HDMI setup below must not run for the DP-IN route. */
+	if (dcp->phy && !dcp->dp_tunnel) {
 		int ret;
 		/*
 		 * Request DP2HDMI related GPIOs as optional for DP-altmode

@@ -51,6 +51,16 @@ MODULE_PARM_DESC(asym_threshold,
 		"threshold (Mb/s) when to Gen 4 switch link symmetry. 0 disables. (default: "
 		__MODULE_STRING(TB_ASYM_THRESHOLD) ")");
 
+/*
+ * Local bring-up knob: bitmask of host router DP IN adapter numbers that
+ * must not be used for DP tunnels. Writable at runtime; takes effect on the
+ * next tunnel search (NHI rebind or hotplug).
+ */
+static unsigned int dp_in_skip_mask;
+module_param(dp_in_skip_mask, uint, 0644);
+MODULE_PARM_DESC(dp_in_skip_mask,
+		 "bitmask of host router DP IN adapter numbers to skip when tunneling (default: 0)");
+
 /**
  * struct tb_cm - Simple Thunderbolt connection manager
  * @tunnel_list: List of active tunnels
@@ -2096,6 +2106,12 @@ static void tb_tunnel_dp(struct tb *tb)
 
 		if (tb_port_is_enabled(port)) {
 			tb_port_dbg(port, "DP IN in use\n");
+			continue;
+		}
+
+		if (!tb_route(port->sw) && (dp_in_skip_mask & BIT(port->port))) {
+			tb_port_info(port, "DP IN skipped (dp_in_skip_mask=0x%x)\n",
+				     dp_in_skip_mask);
 			continue;
 		}
 

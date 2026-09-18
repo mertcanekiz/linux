@@ -265,6 +265,14 @@ struct apple_dcp {
 
 	u32 dptx_phy;
 	u32 dptx_die;
+	/* Opt-in, fixed-route Thunderbolt DP-IN bring-up experiment. */
+	bool dp_tunnel;
+	bool tunnel_mux_selected;
+	u32 dptx_core;
+	u32 tunnel_mux_index;
+	/* crossbar controls for DP IN 0 / DP IN 1 and the selected one */
+	struct mux_control *xbar_dpin[2];
+	u32 tunnel_dpin;
 	int hdmi_hpd_irq;
 };
 

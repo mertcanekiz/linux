@@ -44,6 +44,21 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_tbt.h>
 
+/*
+ * Local DP-IN (DisplayPort over USB4/Thunderbolt) bring-up experiment.
+ * Selects which DisplayPort clocks are enabled inside the PHY while the port
+ * is in USB4/Thunderbolt mode and a display controller is routed to a CIO
+ * DP IN adapter through the display crossbar:
+ *   0: nothing (stock behaviour)
+ *   1: DPRX pixel clock only
+ *   2: DPRX + DPTX pixel clocks and DP PMA lane reset release
+ *   3: full DP-altmode AUX/clock sequence (atcphy_enable_dp_aux)
+ * Writable at runtime; applied on every DP link-rate configure request.
+ */
+static int dpin_clocks = 2;
+module_param(dpin_clocks, int, 0644);
+MODULE_PARM_DESC(dpin_clocks, "DP clock setup for USB4 DP IN adapters (0-3, default 2)");
+
 #define AUSPLL_FSM_CTRL 0x1014
 
 #define AUSPLL_APB_CMD_OVERRIDE 0x2000
@@ -1438,6 +1453,48 @@ static void atcphy_disable_dp_aux(struct apple_atcphy *atcphy)
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
 }
 
+static bool atcphy_mode_is_tunnel(const struct apple_atcphy *atcphy)
+{
+	return atcphy->mode == APPLE_ATCPHY_MODE_USB4 ||
+	       atcphy->mode == APPLE_ATCPHY_MODE_TBT;
+}
+
+/* Local DP-IN bring-up experiment; see the dpin_clocks parameter. */
+static void atcphy_dpin_enable_clocks(struct apple_atcphy *atcphy)
+{
+	u32 ctrl;
+
+	if (dpin_clocks >= 3) {
+		atcphy_enable_dp_aux(atcphy);
+		goto out;
+	}
+
+	if (dpin_clocks >= 2) {
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
+	}
+
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_SELECT,
+		    FIELD_PREP(DPRX_PCLK_SELECT, 1));
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_ENABLE);
+
+	if (dpin_clocks >= 2) {
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
+			    FIELD_PREP(DPTX_PCLK1_SELECT, 1));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_SELECT,
+			    FIELD_PREP(DPTX_PCLK2_SELECT, 1));
+		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
+	}
+
+	core_set32(atcphy, ACIOPHY_PLL_COMMON_CTRL,
+		   ACIOPHY_PLL_WAIT_FOR_CMN_READY_BEFORE_RESET_EXIT);
+out:
+	ctrl = readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
+	dev_info(atcphy->dev, "DP-IN clocks: dpin_clocks=%d TX_DP_CTRL0=0x%08x PCLK_STAT=0x%08x\n",
+		 dpin_clocks, ctrl, readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT));
+}
+
 static int atcphy_dp_configure_lane(struct apple_atcphy *atcphy, enum atcphy_lane lane,
 				    const struct atcphy_dp_link_rate_configuration *cfg)
 {
@@ -1684,8 +1741,20 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
 	cfg = &dp_lr_config[lr];
 
-	if (atcphy->dp_link_rate == lr)
+	if (atcphy_mode_is_tunnel(atcphy)) {
+		/*
+		 * DP-IN bring-up experiment: the display controller output is
+		 * routed to a CIO DP IN adapter, not to the DP lanes. Always
+		 * re-run the clock setup so runtime parameter changes apply.
+		 */
+		dev_info(atcphy->dev, "DP-IN configure: mode %d, link rate index %d, dpin_clocks=%d\n",
+			 atcphy->mode, lr, dpin_clocks);
+		if (!dpin_clocks)
+			return 0;
+		atcphy_dpin_enable_clocks(atcphy);
+	} else if (atcphy->dp_link_rate == lr) {
 		return 0;
+	}
 
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0, reg,
 				 (reg & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY), 10, 10000);
@@ -2083,6 +2152,11 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 		opts->lanes = 2;
 		break;
 	case APPLE_ATCPHY_MODE_DP:
+		opts->lanes = 4;
+		break;
+	case APPLE_ATCPHY_MODE_USB4:
+	case APPLE_ATCPHY_MODE_TBT:
+		/* DP-IN bring-up: virtual 4-lane link into the CIO DP IN adapter. */
 		opts->lanes = 4;
 		break;
 	default:

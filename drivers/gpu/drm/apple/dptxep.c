@@ -5,6 +5,16 @@
 #include <linux/completion.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
+#include <linux/module.h>
+
+/*
+ * DP-IN bring-up: link rate (in Mb/s per lane) to pre-program into the
+ * Type-C PHY when the firmware activates a tunneled DP port, so the CIO DP IN
+ * adapter has DP clocks before the firmware starts AUX traffic. 0 disables.
+ */
+static int dpin_prime_rate = 5400;
+module_param(dpin_prime_rate, int, 0644);
+MODULE_PARM_DESC(dpin_prime_rate, "DP-IN: PHY DP link rate to prime on activate (0=off, default 5400)");
 
 #include "afk.h"
 #include "dcp.h"
@@ -251,11 +261,19 @@ static int dptxport_call_get_max_lane_count(struct apple_epic_service *service,
 	struct dptxport_apcall_lane_count *reply = reply_;
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
-	union phy_configure_opts phy_ops;
+	union phy_configure_opts phy_ops = {};
 	int ret;
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
+
+	if (dcp->dp_tunnel) {
+		/* Virtual DP link into the router, not the Type-C PHY lanes. */
+		dptx->lane_count = 4;
+		reply->retcode = 0;
+		reply->lane_count = cpu_to_le64(dptx->lane_count);
+		return 0;
+	}
 
 	ret = phy_validate(dptx->atcphy, PHY_MODE_DP, 0, &phy_ops);
 	if (ret < 0) {
@@ -482,6 +500,17 @@ dptxport_call_activate(struct apple_epic_service *service,
 	// for standalone phy (i.e. not atc phy).
 	if (!dcp->typec_mux)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+
+	if (dcp->dp_tunnel && dptx->atcphy && dpin_prime_rate) {
+		union phy_configure_opts opts = {};
+		int ret;
+
+		opts.dp.link_rate = dpin_prime_rate;
+		opts.dp.set_rate = 1;
+		ret = phy_configure(dptx->atcphy, &opts);
+		dev_info(dcp->dev, "DP-IN activate: primed PHY DP clocks at %d Mb/s: %d\n",
+			 dpin_prime_rate, ret);
+	}
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)

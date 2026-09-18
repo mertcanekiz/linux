@@ -15,6 +15,7 @@
 #include <drm/drm_managed.h>
 
 #include "dcp-internal.h"
+#include "dcp.h"
 
 enum dcp_chunk_type {
 	DCP_CHUNK_COLOR_ELEMENTS,
@@ -79,6 +80,51 @@ CONNECTOR_DEBUGFS_ENTRY(timing, DCP_CHUNK_TIMING_ELELMENTS);
 CONNECTOR_DEBUGFS_ENTRY(display_attribs, DCP_CHUNK_DISPLAY_ATTRIBUTES);
 CONNECTOR_DEBUGFS_ENTRY(transport, DCP_CHUNK_TRANSPORT);
 
+/* Fixed-route bring-up only: a firmware request is not proof of a picture. */
+static int tunnel_hpd_get(void *data, u64 *value)
+{
+	struct apple_connector *con = data;
+	struct apple_dcp *dcp = platform_get_drvdata(con->dcp);
+
+	mutex_lock(&dcp->hpd_mutex);
+	*value = dcp->dptxport[0].connected;
+	mutex_unlock(&dcp->hpd_mutex);
+	return 0;
+}
+
+static int tunnel_hpd_set(void *data, u64 value)
+{
+	struct apple_connector *con = data;
+	struct apple_dcp *dcp = platform_get_drvdata(con->dcp);
+
+	if (!dcp->dp_tunnel || value > 1)
+		return -EINVAL;
+	return value ? dcp_dptx_connect_oob(con->dcp, 0) :
+		       dcp_dptx_disconnect_oob(con->dcp, 0);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(tunnel_hpd_fops, tunnel_hpd_get, tunnel_hpd_set, "%llu\n");
+
+static int tunnel_dpin_get(void *data, u64 *value)
+{
+	struct apple_connector *con = data;
+	int ret = dcp_dptx_tunnel_get_dpin(con->dcp);
+
+	if (ret < 0)
+		return ret;
+	*value = ret;
+	return 0;
+}
+
+static int tunnel_dpin_set(void *data, u64 value)
+{
+	struct apple_connector *con = data;
+
+	if (value > 1)
+		return -EINVAL;
+	return dcp_dptx_tunnel_select_dpin(con->dcp, value);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(tunnel_dpin_fops, tunnel_dpin_get, tunnel_dpin_set, "%llu\n");
+
 static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct dentry *root)
 {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DEBUG)
@@ -101,6 +147,12 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root)
 {
 	struct apple_connector *apple_con = to_apple_connector(connector);
+	struct apple_dcp *dcp = platform_get_drvdata(apple_con->dcp);
+
+	if (dcp->dp_tunnel) {
+		debugfs_create_file("tunnel_hpd", 0600, root, apple_con, &tunnel_hpd_fops);
+		debugfs_create_file("tunnel_dpin", 0600, root, apple_con, &tunnel_dpin_fops);
+	}
 
         debugfs_create_file("ColorElements", 0444, root, apple_con,
                             &chunk_color_fops);
