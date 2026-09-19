@@ -197,10 +197,16 @@
 #include "hwmon-laptop.dtsi"
 
 /*
- * Local bring-up experiment (DP-IN v3): route the external display controller
- * through the front Type-C port's display crossbar into a CIO DP IN adapter,
- * and give it the Type-C PHY so DP clocks can be configured in USB4 mode.
+ * Local bring-up experiment (DP alt mode): the Asahi "fairydust" wiring for
+ * the front Type-C port. The external display controller drives the Type-C
+ * PHY's DisplayPort lanes through crossbar route 0 (dpphy); HPD comes from the
+ * CD321x data-status register via the connector's "displayport" reference.
+ * This replaces the DP-IN v3 route (apple,tbt-dpin-test) in this DTB variant.
  */
+&typec1 {
+	displayport = <&dcpext>;
+};
+
 &display {
 	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
 };
@@ -220,12 +226,18 @@
 &dcpext {
 	status = "okay";
 	apple,connector-type = "DP";
-	apple,tbt-dpin-test;
 	apple,dptx-phy = <1>;
-	apple,dptx-core = <1>;
 	phys = <&atcphy1 PHY_TYPE_DP>;
 	phy-names = "dp-phy";
-	mux-controls = <&atcphy1_xbar 1>, <&atcphy1_xbar 2>;
-	mux-control-names = "dp-xbar", "dp-xbar-dpin1";
+	mux-controls = <&atcphy1_xbar 0>;
+	mux-control-names = "dp-xbar";
 	mux-index = <0>;
+};
+
+&dpaudio1 {
+	status = "okay";
+};
+
+&ps_atc1_common {
+	apple,always-on; /* fairydust: needed for DP-alt suspend/resume */
 };
