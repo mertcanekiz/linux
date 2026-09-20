@@ -711,4 +711,27 @@ static inline bool usb4_usb3_port_match(struct device *usb4_port_dev,
 }
 #endif /* CONFIG_USB4 */
 
+/*
+ * DP tunnel state notifications. Used by the Apple DCP display driver, whose
+ * external display controller is routed into a host router DP IN adapter
+ * (DP-IN bring-up): it has to run the DisplayPort handshake with its
+ * firmware whenever the connection manager builds or tears down a DP tunnel.
+ * Only tunnels starting at a host router DP IN adapter are reported.
+ */
+enum tb_dp_tunnel_event_type {
+	TB_DP_TUNNEL_DOWN = 0,
+	TB_DP_TUNNEL_UP = 1,
+};
+
+struct tb_dp_tunnel_event {
+	struct device *nhi_dev;	/* the host interface (its of_node names the port) */
+	u64 out_route;		/* route string of the router with the DP OUT adapter */
+	u8 in_port;		/* host router DP IN adapter number */
+	u8 out_port;		/* DP OUT adapter number on the remote router */
+};
+
+struct notifier_block;
+int tb_dp_tunnel_notifier_register(struct notifier_block *nb);
+int tb_dp_tunnel_notifier_unregister(struct notifier_block *nb);
+
 #endif /* THUNDERBOLT_H_ */

@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/pm_runtime.h>
 #include <linux/platform_data/x86/apple.h>
+#include <linux/notifier.h>
 
 #include "tb.h"
 #include "tb_regs.h"
@@ -102,6 +103,82 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
 static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port,
 					  int retry, unsigned long delay);
 static void tb_dp_tunnel_active(struct tb_tunnel *tunnel);
+
+/*
+ * DP tunnel up/down notifications for the Apple DCP driver (DP-IN bring-up).
+ * The current set of active host DP IN tunnels is kept so a subscriber that
+ * registers after the tunnel was built (the display driver probing later
+ * than the connection manager, or being reloaded) gets it replayed.
+ */
+static BLOCKING_NOTIFIER_HEAD(tb_dp_tunnel_chain);
+static DEFINE_MUTEX(tb_dp_tunnel_state_lock);
+static LIST_HEAD(tb_dp_tunnel_state);
+
+struct tb_dp_tunnel_state_entry {
+	struct list_head list;
+	struct tb_dp_tunnel_event ev;
+};
+
+static void tb_dp_tunnel_notify(struct tb_tunnel *tunnel, bool up)
+{
+	struct tb_dp_tunnel_state_entry *e, *tmp;
+	struct tb_dp_tunnel_event ev = {
+		.nhi_dev = tunnel->tb->nhi->dev,
+		.out_route = tb_route(tunnel->dst_port->sw),
+		.in_port = tunnel->src_port->port,
+		.out_port = tunnel->dst_port->port,
+	};
+
+	/* only tunnels starting at a host router DP IN adapter */
+	if (tb_route(tunnel->src_port->sw))
+		return;
+
+	mutex_lock(&tb_dp_tunnel_state_lock);
+	list_for_each_entry_safe(e, tmp, &tb_dp_tunnel_state, list) {
+		if (e->ev.nhi_dev == ev.nhi_dev && e->ev.in_port == ev.in_port) {
+			list_del(&e->list);
+			kfree(e);
+		}
+	}
+	if (up) {
+		e = kzalloc(sizeof(*e), GFP_KERNEL);
+		if (e) {
+			e->ev = ev;
+			list_add_tail(&e->list, &tb_dp_tunnel_state);
+		}
+	}
+	mutex_unlock(&tb_dp_tunnel_state_lock);
+
+	tb_port_info(tunnel->src_port, "DP tunnel %s notification (DP OUT %llx:%u)\n",
+		     up ? "up" : "down", ev.out_route, ev.out_port);
+	blocking_notifier_call_chain(&tb_dp_tunnel_chain,
+				     up ? TB_DP_TUNNEL_UP : TB_DP_TUNNEL_DOWN, &ev);
+}
+
+int tb_dp_tunnel_notifier_register(struct notifier_block *nb)
+{
+	struct tb_dp_tunnel_state_entry *e;
+	int ret;
+
+	ret = blocking_notifier_chain_register(&tb_dp_tunnel_chain, nb);
+	if (ret)
+		return ret;
+
+	/* replay the tunnels that are already up */
+	mutex_lock(&tb_dp_tunnel_state_lock);
+	list_for_each_entry(e, &tb_dp_tunnel_state, list)
+		nb->notifier_call(nb, TB_DP_TUNNEL_UP, &e->ev);
+	mutex_unlock(&tb_dp_tunnel_state_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tb_dp_tunnel_notifier_register);
+
+int tb_dp_tunnel_notifier_unregister(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&tb_dp_tunnel_chain, nb);
+}
+EXPORT_SYMBOL_GPL(tb_dp_tunnel_notifier_unregister);
 
 static void tb_queue_hotplug(struct tb *tb, u64 route, u8 port, bool unplug)
 {
@@ -1750,6 +1827,7 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 
 	switch (tunnel->type) {
 	case TB_TUNNEL_DP:
+		tb_dp_tunnel_notify(tunnel, false);
 		tb_detach_bandwidth_group(src_port);
 		/*
 		 * In case of DP tunnel make sure the DP IN resource is
@@ -2065,6 +2143,7 @@ static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 		goto err_free;
 	}
 
+	tb_dp_tunnel_notify(tunnel, true);
 	return;
 
 err_free:

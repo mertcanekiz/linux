@@ -59,6 +59,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_tunnel_select_dpin(struct platform_device *pdev, u32 dpin);
 int dcp_dptx_tunnel_get_dpin(struct platform_device *pdev);
+bool dcp_needs_poweron(struct platform_device *pdev);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);

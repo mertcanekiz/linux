@@ -22,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
+#include <linux/thunderbolt.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -58,6 +59,10 @@ MODULE_PARM_DESC(dpin_connect_unk, "DP-IN: connectTo unk field (macOS 13.5 sends
 static bool dpin_hpd_after_activate = true;
 module_param(dpin_hpd_after_activate, bool, 0644);
 MODULE_PARM_DESC(dpin_hpd_after_activate, "DP-IN: assert HPD right after ACTIVATE like macOS (0: after link config)");
+
+static bool dpin_auto = true;
+module_param(dpin_auto, bool, 0644);
+MODULE_PARM_DESC(dpin_auto, "DP-IN: connect/disconnect automatically when the Thunderbolt DP tunnel comes and goes");
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
@@ -363,7 +368,26 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 		return -EINVAL;
 	}
 
+	/*
+	 * DP-IN: after a tunnel reconnect the compositor may keep its output
+	 * state and never send the mode again; the firmware then swallows every
+	 * swap ("fControllerPowerState is 0"). Turn that commit into a real
+	 * modeset (amdgpu does the same in its atomic_check).
+	 */
+	if (dcp->dp_tunnel && crtc_state->active && !dcp->valid_mode &&
+	    dcp->connector->connected && !drm_atomic_crtc_needs_modeset(crtc_state)) {
+		dev_info(dcp->dev, "crtc_atomic_check: forcing a modeset (no valid mode)\n");
+		crtc_state->mode_changed = true;
+	}
+
 	return 0;
+}
+
+bool dcp_needs_poweron(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->dp_tunnel && !dcp->powered;
 }
 
 int dcp_get_connector_type(struct platform_device *pdev)
@@ -712,7 +736,91 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	if (dcp->dptxport[port].enabled)
 		dptxport_set_hpd(dcp->dptxport[port].service, false);
 
+	/* the firmware powers the external pipeline down on HPD removal */
+	if (dcp->dp_tunnel)
+		dcp->powered = false;
+
 	return dcp_dptx_disconnect(dcp, port);
+}
+
+/*
+ * Thunderbolt DP tunnel driven hotplug: the connection manager tells us when
+ * a DP tunnel from a host DP IN adapter comes up or goes away; the actual
+ * connect/disconnect runs from a work item (it blocks for seconds and needs
+ * the DCP endpoints, which may come up after the tunnel at boot).
+ */
+#define DPIN_HOTPLUG_RETRIES	60
+
+static void dcp_dpin_hotplug_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, dpin_hotplug_work.work);
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	bool up = READ_ONCE(dcp->dpin_tunnel_up);
+	u32 in_port = READ_ONCE(dcp->dpin_tunnel_in_port);
+	int ret;
+
+	if (!up) {
+		if (dcp->dptxport[0].connected) {
+			ret = dcp_dptx_disconnect_oob(pdev, 0);
+			dev_info(dcp->dev, "DP-IN auto disconnect (tunnel down): %d\n", ret);
+		}
+		return;
+	}
+
+	if (!dcp->active || !dcp->dptxport[0].enabled || !dcp->connector) {
+		if (dcp->dpin_hotplug_retries++ < DPIN_HOTPLUG_RETRIES) {
+			schedule_delayed_work(&dcp->dpin_hotplug_work, HZ / 2);
+			return;
+		}
+		dev_warn(dcp->dev, "DP-IN auto connect: DCP not ready, giving up\n");
+		return;
+	}
+
+	if (dcp->dptxport[0].connected)
+		return;
+
+	ret = dcp_dptx_tunnel_select_dpin(pdev, in_port == 6 ? 1 : 0);
+	if (ret)
+		dev_warn(dcp->dev, "DP-IN auto connect: cannot select dpin for DP IN %u: %d\n",
+			 in_port, ret);
+	ret = dcp_dptx_connect_oob(pdev, 0);
+	dev_info(dcp->dev, "DP-IN auto connect (tunnel up on host DP IN %u): %d\n", in_port, ret);
+	if (ret == -ENODEV && dcp->dpin_hotplug_retries++ < DPIN_HOTPLUG_RETRIES)
+		schedule_delayed_work(&dcp->dpin_hotplug_work, HZ / 2);
+}
+
+static int dcp_tb_dp_notifier(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_dcp *dcp = container_of(nb, struct apple_dcp, tb_dp_nb);
+	struct tb_dp_tunnel_event *ev = data;
+	bool up = action == TB_DP_TUNNEL_UP;
+
+	if (!dpin_auto)
+		return NOTIFY_DONE;
+	if (dcp->tb_nhi_node && (!ev->nhi_dev || ev->nhi_dev->of_node != dcp->tb_nhi_node))
+		return NOTIFY_DONE;
+	if (ev->in_port != 5 && ev->in_port != 6)
+		return NOTIFY_DONE;
+
+	dev_info(dcp->dev, "DP tunnel %s on host DP IN %u (DP OUT %llx:%u)\n",
+		 up ? "up" : "down", ev->in_port, ev->out_route, ev->out_port);
+	WRITE_ONCE(dcp->dpin_tunnel_in_port, ev->in_port);
+	WRITE_ONCE(dcp->dpin_tunnel_up, up);
+	dcp->dpin_hotplug_retries = 0;
+	/* a short delay after tunnel activation lets the AUX paths settle */
+	mod_delayed_work(system_wq, &dcp->dpin_hotplug_work, up ? HZ / 2 : 0);
+	return NOTIFY_OK;
+}
+
+static void dcp_dpin_auto_stop(struct apple_dcp *dcp)
+{
+	if (dcp->tb_dp_nb_registered) {
+		tb_dp_tunnel_notifier_unregister(&dcp->tb_dp_nb);
+		dcp->tb_dp_nb_registered = false;
+	}
+	cancel_delayed_work_sync(&dcp->dpin_hotplug_work);
+	of_node_put(dcp->tb_nhi_node);
+	dcp->tb_nhi_node = NULL;
 }
 
 static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
@@ -933,6 +1041,7 @@ void dcp_poweron(struct platform_device *pdev)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+	dcp->powered = true;
 
 	if (dcp->avep)
 		av_service_connect(dcp);
@@ -946,6 +1055,7 @@ void dcp_poweroff(struct platform_device *pdev)
 		av_service_disconnect(dcp);
 
 	_dcp_poweroff(dcp);
+	dcp->powered = false;
 
 	if (dcp->hdmi_hpd) {
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
@@ -1487,6 +1597,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		}
 		mutex_init(&dcp->dpin_lock);
 		init_completion(&dcp->dpin_activate_completion);
+		INIT_DELAYED_WORK(&dcp->dpin_hotplug_work, dcp_dpin_hotplug_work);
+		dcp->tb_nhi_node = of_parse_phandle(dev->of_node, "apple,tbt-nhi", 0);
+		dcp->tb_dp_nb.notifier_call = dcp_tb_dp_notifier;
+		if (tb_dp_tunnel_notifier_register(&dcp->tb_dp_nb) == 0)
+			dcp->tb_dp_nb_registered = true;
+		else
+			dev_warn(dev, "DP-IN: cannot subscribe to Thunderbolt DP tunnel events\n");
 		dev_warn(dev, "Experimental DP-IN route (%s dpin bridge regs); connect through tunnel_hpd debugfs\n",
 			 dcp->dpin_regs[dcp->tunnel_dpin] ? "with" : "WITHOUT");
 	}
@@ -1609,11 +1726,19 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 static void dcp_platform_remove(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->dp_tunnel)
+		dcp_dpin_auto_stop(dcp);
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
 static void dcp_platform_shutdown(struct platform_device *pdev)
 {
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	if (dcp && dcp->dp_tunnel)
+		dcp_dpin_auto_stop(dcp);
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 

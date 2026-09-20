@@ -106,7 +106,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	struct drm_crtc_state *crtc_state;
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
-	if (crtc_state->active_changed && crtc_state->active) {
+	if (crtc_state->active &&
+	    (crtc_state->active_changed || dcp_needs_poweron(to_apple_crtc(crtc)->dcp))) {
 		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		dcp_poweron(apple_crtc->dcp);
 		/* Force the CTM to be set on first swap */

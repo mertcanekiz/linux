@@ -278,6 +278,16 @@ struct apple_dcp {
 	struct mutex dpin_lock;
 	bool dpin_active;
 	struct completion dpin_activate_completion;
+	/* Thunderbolt DP tunnel driven hotplug */
+	struct notifier_block tb_dp_nb;
+	bool tb_dp_nb_registered;
+	struct device_node *tb_nhi_node;
+	struct delayed_work dpin_hotplug_work;
+	bool dpin_tunnel_up;
+	u32 dpin_tunnel_in_port;
+	unsigned int dpin_hotplug_retries;
+	/* firmware display pipeline powered (set_power_state) */
+	bool powered;
 	int hdmi_hpd_irq;
 };
 
