@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iommu.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
@@ -40,6 +41,23 @@
 #include "iomfb.h"
 #include "parser.h"
 #include "trace.h"
+
+/*
+ * DP-IN (DisplayPort over Thunderbolt) bring-up knobs. Defaults follow the
+ * macOS 13.5 sequence captured with the m1n1 hypervisor
+ * (reports/usb4-dpin-v3/HV-TRACE-FINDINGS.md in the project repository).
+ */
+static bool dpin_validate;
+module_param(dpin_validate, bool, 0644);
+MODULE_PARM_DESC(dpin_validate, "DP-IN: send validateConnection before connectTo (macOS does not)");
+
+static unsigned int dpin_connect_unk = 0xb0101;
+module_param(dpin_connect_unk, uint, 0644);
+MODULE_PARM_DESC(dpin_connect_unk, "DP-IN: connectTo unk field (macOS 13.5 sends 0xb0101)");
+
+static bool dpin_hpd_after_activate = true;
+module_param(dpin_hpd_after_activate, bool, 0644);
+MODULE_PARM_DESC(dpin_hpd_after_activate, "DP-IN: assert HPD right after ACTIVATE like macOS (0: after link config)");
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
@@ -355,6 +373,152 @@ int dcp_get_connector_type(struct platform_device *pdev)
 	return (dcp->connector_type);
 }
 
+/*
+ * Apple "atc-dpin" DP IN bridge block (ADT atc1-dpin0 @ 0x501e50000). Offsets
+ * and order from the m1n1 hypervisor trace of AppleATCDPINAdapterPort:
+ *   0x08 <- 3 before the DCP is told to connect, <- 0 on DEACTIVATE
+ *   0x04 / 0x00 read, then written back unchanged (interrupt ack style)
+ *   0x0c DPTX_INACTIVE: cleared inside ACTIVATE (after the crossbar mux
+ *        select), set to 1 and cleared again around the crossbar teardown
+ *   0x10 DPTX_INACTIVE_ACK: read after each 0x0c write
+ */
+#define DPIN_REG_00		0x00
+#define DPIN_REG_04		0x04
+#define DPIN_ENABLE		0x08
+#define DPIN_ENABLE_BITS	0x3
+#define DPIN_DPTX_INACTIVE	0x0c
+#define DPIN_DPTX_INACTIVE_ACK	0x10
+
+static void __iomem *dcp_dpin_base(struct apple_dcp *dcp)
+{
+	if (!dcp->dp_tunnel || dcp->tunnel_dpin > 1)
+		return NULL;
+	return dcp->dpin_regs[dcp->tunnel_dpin];
+}
+
+static void dcp_dpin_dump(struct apple_dcp *dcp, const char *what)
+{
+	void __iomem *base = dcp_dpin_base(dcp);
+
+	if (!base)
+		return;
+	dev_info(dcp->dev, "DP-IN dpin%u %s: 00=%08x 04=%08x 08=%08x 0c=%08x 10=%08x\n",
+		 dcp->tunnel_dpin, what, readl(base + DPIN_REG_00),
+		 readl(base + DPIN_REG_04), readl(base + DPIN_ENABLE),
+		 readl(base + DPIN_DPTX_INACTIVE), readl(base + DPIN_DPTX_INACTIVE_ACK));
+}
+
+/* Phase 1 of the macOS sequence: right before connectTo. */
+static void dcp_dpin_enable(struct apple_dcp *dcp)
+{
+	void __iomem *base = dcp_dpin_base(dcp);
+	u32 r04, r00;
+
+	if (!base)
+		return;
+	dcp_dpin_dump(dcp, "before enable");
+	writel(DPIN_ENABLE_BITS, base + DPIN_ENABLE);
+	r04 = readl(base + DPIN_REG_04);
+	r00 = readl(base + DPIN_REG_00);
+	readl(base + DPIN_REG_04);
+	writel(r04, base + DPIN_REG_04);
+	writel(r00, base + DPIN_REG_00);
+	dcp_dpin_dump(dcp, "after enable");
+}
+
+/* Inside DPTX_APCALL_ACTIVATE: AppleATCDPINAdapterPort::makeDPINAdapterPortActive. */
+void dcp_dpin_activate(struct apple_dcp *dcp)
+{
+	void __iomem *base = dcp_dpin_base(dcp);
+	u32 ack = ~0;
+	int ret = -ENODEV;
+
+	if (base) {
+		mutex_lock(&dcp->dpin_lock);
+		writel(0, base + DPIN_DPTX_INACTIVE);
+		ret = readl_poll_timeout(base + DPIN_DPTX_INACTIVE_ACK, ack, !(ack & 1),
+						 100, 500 * USEC_PER_MSEC);
+		dcp->dpin_active = true;
+		mutex_unlock(&dcp->dpin_lock);
+	}
+	dev_info(dcp->dev, "DP-IN dpin%u activate: DPTX_INACTIVE cleared, ack=0x%x (%d)\n",
+		 dcp->tunnel_dpin, ack, ret);
+	complete(&dcp->dpin_activate_completion);
+}
+
+/* DPTX_APCALL_DEACTIVATE: the last macOS write of the teardown. */
+void dcp_dpin_deactivate(struct apple_dcp *dcp)
+{
+	void __iomem *base = dcp_dpin_base(dcp);
+
+	if (!base)
+		return;
+	mutex_lock(&dcp->dpin_lock);
+	if (dcp->tunnel_mux_selected) {
+		/* firmware skipped WILL_CHANGE_LINK_CONFIG; mirror the teardown anyway */
+		writel(1, base + DPIN_DPTX_INACTIVE);
+		mux_control_deselect(dcp->xbar);
+		dcp->tunnel_mux_selected = false;
+	}
+	writel(0, base + DPIN_ENABLE);
+	dcp->dpin_active = false;
+	dcp_dpin_dump(dcp, "after deactivate");
+	mutex_unlock(&dcp->dpin_lock);
+}
+
+/*
+ * Inside DPTX_APCALL_SET_LINK_RATE, after the PHY PCLK is up: route dispext0
+ * into the DP IN adapter (AppleT8103ATCDPXBAR::bringConnectionUp). The mux
+ * driver writes the same nine enable bits in the same order as macOS and
+ * pulses FIFO_RD_PCLK1_EN, so it is used as is.
+ */
+int dcp_dpin_xbar_up(struct apple_dcp *dcp)
+{
+	int ret = 0;
+
+	if (!dcp->dp_tunnel)
+		return 0;
+	mutex_lock(&dcp->dpin_lock);
+	if (!dcp->tunnel_mux_selected) {
+		ret = mux_control_select(dcp->xbar, dcp->tunnel_mux_index);
+		if (!ret)
+			dcp->tunnel_mux_selected = true;
+		dev_info(dcp->dev, "DP-IN crossbar up (dpin%u <- dispext%u): %d\n",
+			 dcp->tunnel_dpin, dcp->tunnel_mux_index, ret);
+	}
+	mutex_unlock(&dcp->dpin_lock);
+	return ret;
+}
+
+/*
+ * Inside DPTX_APCALL_WILL_CHANGE_LINK_CONFIG on unplug: DPTX_INACTIVE = 1,
+ * crossbar teardown, DPTX_INACTIVE = 0 again (run 8 trace lines 2733-2830).
+ * No-op while the crossbar is down (initial link configuration).
+ */
+void dcp_dpin_xbar_down(struct apple_dcp *dcp)
+{
+	void __iomem *base = dcp_dpin_base(dcp);
+
+	if (!dcp->dp_tunnel)
+		return;
+	mutex_lock(&dcp->dpin_lock);
+	if (dcp->tunnel_mux_selected) {
+		if (base) {
+			writel(1, base + DPIN_DPTX_INACTIVE);
+			readl(base + DPIN_DPTX_INACTIVE_ACK);
+		}
+		mux_control_deselect(dcp->xbar);
+		dcp->tunnel_mux_selected = false;
+		if (base) {
+			writel(0, base + DPIN_DPTX_INACTIVE);
+			readl(base + DPIN_DPTX_INACTIVE_ACK);
+		}
+		dev_info(dcp->dev, "DP-IN crossbar down (dpin%u)\n", dcp->tunnel_dpin);
+		dcp_dpin_dump(dcp, "after crossbar down");
+	}
+	mutex_unlock(&dcp->dpin_lock);
+}
+
 #define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
 
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
@@ -378,34 +542,54 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 		goto out_unlock;
 
 	if (dcp->dp_tunnel) {
-		ret = mux_control_select(dcp->xbar, dcp->tunnel_mux_index);
-		if (ret)
-			goto out_unlock;
-		dcp->tunnel_mux_selected = true;
-		ret = dptxport_validate_connection(dcp->dptxport[port].service,
-				dcp->dptx_core, dcp->dptx_phy, dcp->dptx_die);
-		dev_info(dcp->dev, "DP tunnel validate core=%u ATC=%u die=%u: %d\n",
-			 dcp->dptx_core, dcp->dptx_phy, dcp->dptx_die, ret);
-		if (ret)
-			goto out_mux;
+		/*
+		 * macOS order (HV-TRACE-FINDINGS.md): dpin block enable,
+		 * connectTo(unk=0xb0101), requestDisplay (the tracer's
+		 * "setPowerState"), then HPD right after the firmware's ACTIVATE
+		 * call. The crossbar is only enabled inside SET_LINK_RATE.
+		 */
+		reinit_completion(&dcp->dpin_activate_completion);
+		dcp_dpin_enable(dcp);
+		if (dpin_validate) {
+			ret = dptxport_validate_connection(dcp->dptxport[port].service,
+					dcp->dptx_core, dcp->dptx_phy, dcp->dptx_die);
+			dev_info(dcp->dev, "DP tunnel validate core=%u ATC=%u die=%u: %d\n",
+				 dcp->dptx_core, dcp->dptx_phy, dcp->dptx_die, ret);
+			if (ret)
+				goto out_unlock;
+		}
 	}
 
 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
 	dcp->dptxport[port].atcphy = dcp->phy;
 	ret = dptxport_connect(dcp->dptxport[port].service, dcp->dptx_core,
-			       dcp->dptx_phy, dcp->dptx_die);
+			       dcp->dptx_phy, dcp->dptx_die,
+			       dcp->dp_tunnel ? dpin_connect_unk : 0);
 	if (ret) {
 		dev_err(dcp->dev, "DPTX connect failed: %d\n", ret);
-		goto out_mux;
+		goto out_unlock;
 	}
 	ret = dptxport_request_display(dcp->dptxport[port].service);
 	if (ret) {
 		dev_err(dcp->dev, "DPTX display request failed: %d\n", ret);
-		goto out_mux;
+		goto out_unlock;
 	}
 	dcp->dptxport[port].connected = true;
 
 	mutex_unlock(&dcp->hpd_mutex);
+
+	if (dcp->dp_tunnel && dpin_hpd_after_activate &&
+	    dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+		ret = wait_for_completion_timeout(&dcp->dpin_activate_completion,
+						  DPTX_CONNECT_TIMEOUT);
+		if (!ret)
+			dev_warn(dcp->dev, "dcp_dptx_connect: no ACTIVATE from the firmware\n");
+		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		dev_info(dcp->dev, "DPTX HPD assert (after activate): %d\n", ret);
+		if (ret)
+			return ret;
+	}
+
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 				    DPTX_CONNECT_TIMEOUT);
 	if (!ret)
@@ -417,23 +601,22 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
+	    !(dcp->dp_tunnel && dpin_hpd_after_activate)) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
 		dev_info(dcp->dev, "DPTX HPD assert: %d\n", ret);
 		if (ret)
 			return ret;
 	}
 
+	if (dcp->dp_tunnel)
+		dcp_dpin_dump(dcp, "after connect");
+
 	if (dcp->avep)
 		av_service_connect(dcp);
 
 	return 0;
 
-out_mux:
-	if (dcp->tunnel_mux_selected) {
-		mux_control_deselect(dcp->xbar);
-		dcp->tunnel_mux_selected = false;
-	}
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
@@ -460,12 +643,14 @@ static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 			goto out_unlock;
 		dcp->dptxport[port].connected = false;
 	}
-	if (dcp->tunnel_mux_selected) {
-		ret = mux_control_deselect(dcp->xbar);
-		dcp->tunnel_mux_selected = false;
-	}
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
+
+	if (dcp->dp_tunnel) {
+		/* the firmware normally tears these down through its AP calls */
+		dcp_dpin_xbar_down(dcp);
+		dcp_dpin_deactivate(dcp);
+	}
 
 	return ret;
 }
@@ -1289,7 +1474,21 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		if (!dcp->xbar)
 			return dev_err_probe(dev, -ENODEV, "DP-IN %u crossbar control missing\n",
 					     dcp->tunnel_dpin);
-		dev_warn(dev, "Experimental DP-IN route; connect manually through tunnel_hpd debugfs\n");
+		for (int i = 0; i < 2; i++) {
+			struct device_node *np;
+
+			np = of_parse_phandle(dev->of_node, "apple,tbt-dpin", i);
+			if (!np)
+				continue;
+			dcp->dpin_regs[i] = of_iomap(np, 0);
+			of_node_put(np);
+			if (!dcp->dpin_regs[i])
+				return dev_err_probe(dev, -ENOMEM, "cannot map DP IN %d bridge\n", i);
+		}
+		mutex_init(&dcp->dpin_lock);
+		init_completion(&dcp->dpin_activate_completion);
+		dev_warn(dev, "Experimental DP-IN route (%s dpin bridge regs); connect through tunnel_hpd debugfs\n",
+			 dcp->dpin_regs[dcp->tunnel_dpin] ? "with" : "WITHOUT");
 	}
 
 	dcp->phy = devm_phy_optional_get(dev, "dp-phy");

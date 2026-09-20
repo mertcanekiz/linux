@@ -46,18 +46,18 @@
 
 /*
  * Local DP-IN (DisplayPort over USB4/Thunderbolt) bring-up experiment.
- * Selects which DisplayPort clocks are enabled inside the PHY while the port
- * is in USB4/Thunderbolt mode and a display controller is routed to a CIO
- * DP IN adapter through the display crossbar:
+ * Selects how the PHY's DisplayPort pixel clock (PCLK1) is brought up while
+ * the port is in USB4/Thunderbolt mode and a display controller is routed to
+ * a CIO DP IN adapter through the display crossbar:
  *   0: nothing (stock behaviour)
- *   1: DPRX pixel clock only
- *   2: DPRX + DPTX pixel clocks and DP PMA lane reset release
- *   3: full DP-altmode AUX/clock sequence (atcphy_enable_dp_aux)
+ *   1: replay of the macOS 13.5 AppleT8103TypeCPhy::configureDPTunnelMode
+ *      register sequence captured with the m1n1 hypervisor (default)
+ *   2: legacy v3 experiment: DP alt-mode PLL tables plus DPRX/DPTX clocks
  * Writable at runtime; applied on every DP link-rate configure request.
  */
-static int dpin_clocks = 2;
-module_param(dpin_clocks, int, 0644);
-MODULE_PARM_DESC(dpin_clocks, "DP clock setup for USB4 DP IN adapters (0-3, default 2)");
+static int dpin_mode = 1;
+module_param(dpin_mode, int, 0644);
+MODULE_PARM_DESC(dpin_mode, "DP-IN PCLK setup in USB4/TBT mode (0=off, 1=macOS tunnel sequence, 2=legacy v3)");
 
 #define AUSPLL_FSM_CTRL 0x1014
 
@@ -1459,40 +1459,64 @@ static bool atcphy_mode_is_tunnel(const struct apple_atcphy *atcphy)
 	       atcphy->mode == APPLE_ATCPHY_MODE_TBT;
 }
 
-/* Local DP-IN bring-up experiment; see the dpin_clocks parameter. */
-static void atcphy_dpin_enable_clocks(struct apple_atcphy *atcphy)
+/* Legacy v3 DP-IN experiment (dpin_mode=2): DP alt-mode style clock enables. */
+static void atcphy_dpin_enable_clocks_legacy(struct apple_atcphy *atcphy)
 {
-	u32 ctrl;
-
-	if (dpin_clocks >= 3) {
-		atcphy_enable_dp_aux(atcphy);
-		goto out;
-	}
-
-	if (dpin_clocks >= 2) {
-		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
-		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
-	}
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
 
 	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_SELECT,
 		    FIELD_PREP(DPRX_PCLK_SELECT, 1));
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_ENABLE);
-
-	if (dpin_clocks >= 2) {
-		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
-			    FIELD_PREP(DPTX_PCLK1_SELECT, 1));
-		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
-		core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_SELECT,
-			    FIELD_PREP(DPTX_PCLK2_SELECT, 1));
-		core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
-	}
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
+		    FIELD_PREP(DPTX_PCLK1_SELECT, 1));
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_SELECT,
+		    FIELD_PREP(DPTX_PCLK2_SELECT, 1));
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
 
 	core_set32(atcphy, ACIOPHY_PLL_COMMON_CTRL,
 		   ACIOPHY_PLL_WAIT_FOR_CMN_READY_BEFORE_RESET_EXIT);
-out:
-	ctrl = readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
-	dev_info(atcphy->dev, "DP-IN clocks: dpin_clocks=%d TX_DP_CTRL0=0x%08x PCLK_STAT=0x%08x\n",
-		 dpin_clocks, ctrl, readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT));
+}
+
+/*
+ * DP-IN PCLK1 bring-up exactly as macOS 13.5 does it in
+ * AppleT8103TypeCPhy::configureDPTunnelMode ("Configuring PCLK(1) at link
+ * rate: 20"), captured with the m1n1 hypervisor while the LG UltraFine came up
+ * (reports/usb4-dpin-v3/HV-TRACE-FINDINGS.md, run 8 trace lines 2171-2276):
+ *   TX_DP_CTRL0        0xe001 -> 0xe005 -> 0xe00d -> 0xe01d (PCLK1 select only,
+ *                      DP_PMA_BYTECLK_RESET stays set)
+ *   AUSPLL_FREQ_CFG    refclk bits cleared
+ *   FREQ_DESC_A/B/C    0x1e0e021c / 0x0 / 0x654a00
+ *   CLKOUT_DIV         refbufclk divider 1 (DP alt mode uses 7)
+ *   CLKOUT_DTC_VREG    bypass kept, BGR ctrl-avail set
+ *   CLKOUT_MASTER      pclk, pclk2, refbufclk drivers enabled
+ *   APB command 0, wait ACIOPHY_DP_PCLK_STAT lock, APB command 0x2000 (not 0x2800)
+ * The VCO settings are the RBR ones (count 0x21c, no fraction) with the pixel
+ * clock divider 5 and vclk_op_divn 2: the HBR2 symbol clock from a 6.48 GHz
+ * VCO, unlike the DP alt-mode HBR2 table which runs the VCO at 5.4 GHz.
+ */
+static const struct atcphy_dp_link_rate_configuration dp_tunnel_pclk_config = {
+	.freqinit_count_target = 0x21c,
+	.fbdivn_frac_den = 0x0,
+	.fbdivn_frac_num = 0x0,
+	.pclk_div_sel = 0x5,
+	.lfclk_ctrl = 0x5,
+	.vclk_op_divn = 0x2,
+	.plla_clkout_vreg_bypass = true,
+	.txa_ldoclk_bypass = true,
+	.txa_div2_en = false,
+};
+
+static void atcphy_dp_tunnel_enable_pclk(struct apple_atcphy *atcphy)
+{
+	/* macOS starts from 0xe001: the three pixel clock enables already set */
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		   DPTX_PCLK1_ENABLE | DPTX_PCLK2_ENABLE | DPRX_PCLK_ENABLE);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_SELECT,
+		    FIELD_PREP(DPTX_PCLK1_SELECT, 1));
 }
 
 static int atcphy_dp_configure_lane(struct apple_atcphy *atcphy, enum atcphy_lane lane,
@@ -1734,6 +1758,7 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 {
 	const struct atcphy_dp_link_rate_configuration *cfg;
 	const struct atcphy_mode_configuration *mode_cfg;
+	bool tunnel = false;
 	int ret;
 	u32 reg;
 
@@ -1743,15 +1768,24 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 
 	if (atcphy_mode_is_tunnel(atcphy)) {
 		/*
-		 * DP-IN bring-up experiment: the display controller output is
-		 * routed to a CIO DP IN adapter, not to the DP lanes. Always
-		 * re-run the clock setup so runtime parameter changes apply.
+		 * DP-IN bring-up: the display controller output is routed to a
+		 * CIO DP IN adapter, not to the DP lanes; only PCLK1 matters.
+		 * Always re-run the setup so runtime parameter changes apply.
 		 */
-		dev_info(atcphy->dev, "DP-IN configure: mode %d, link rate index %d, dpin_clocks=%d\n",
-			 atcphy->mode, lr, dpin_clocks);
-		if (!dpin_clocks)
+		dev_info(atcphy->dev, "DP-IN configure: mode %d, link rate index %d, dpin_mode=%d\n",
+			 atcphy->mode, lr, dpin_mode);
+		switch (dpin_mode) {
+		case 1:
+			tunnel = true;
+			cfg = &dp_tunnel_pclk_config;
+			atcphy_dp_tunnel_enable_pclk(atcphy);
+			break;
+		case 2:
+			atcphy_dpin_enable_clocks_legacy(atcphy);
+			break;
+		default:
 			return 0;
-		atcphy_dpin_enable_clocks(atcphy);
+		}
 	} else if (atcphy->dp_link_rate == lr) {
 		return 0;
 	}
@@ -1792,8 +1826,9 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 		    FIELD_PREP(AUSPLL_FD_VCLK_OP_DIVN, cfg->vclk_op_divn));
 	core_set32(atcphy, AUSPLL_FREQ_DESC_C, AUSPLL_FD_VCLK_PRE_DIVN);
 
+	/* macOS: divider 1 for the DP-IN tunnel PCLK, 7 for DP alt mode */
 	core_mask32(atcphy, AUSPLL_CLKOUT_DIV, AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI,
-		    FIELD_PREP(AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI, 7));
+		    FIELD_PREP(AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI, tunnel ? 1 : 7));
 
 	if (cfg->plla_clkout_vreg_bypass)
 		core_set32(atcphy, AUSPLL_CLKOUT_DTC_VREG, AUSPLL_DTC_VREG_BYPASS);
@@ -1817,7 +1852,7 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 		return ret;
 	}
 
-	ret = atcphy_auspll_apb_command(atcphy, 0x2800);
+	ret = atcphy_auspll_apb_command(atcphy, tunnel ? 0x2000 : 0x2800);
 	if (ret)
 		return ret;
 
@@ -1833,10 +1868,45 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 			return ret;
 	}
 
+	if (tunnel) {
+		/* macOS leaves the DP byte clock in reset in tunnel mode */
+		dev_info(atcphy->dev, "DP-IN PCLK on: TX_DP_CTRL0=0x%08x PCLK_STAT=0x%08x CLKOUT_MASTER=0x%08x\n",
+			 readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+			 readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT),
+			 readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER));
+		atcphy->dp_link_rate = lr;
+		return 0;
+	}
+
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DP_PMA_BYTECLK_RESET);
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DP_MAC_DIV20_CLK_SEL);
 
 	atcphy->dp_link_rate = lr;
+	return 0;
+}
+
+/*
+ * Inverse of the above, from AppleT8103TypeCPhy::unconfigureDPTunnelMode
+ * (run 8 trace lines 2889-2900): drop the three CLKOUT_MASTER drivers in the
+ * order pclk, pclk2, refbufclk, then APB command 3.
+ */
+static int atcphy_dp_tunnel_disable_pclk(struct apple_atcphy *atcphy)
+{
+	guard(mutex)(&atcphy->lock);
+
+	if (!atcphy_mode_is_tunnel(atcphy))
+		return 0;
+
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK_DRVR_EN);
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK2_DRVR_EN);
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_REFBUFCLK_DRVR_EN);
+	atcphy_auspll_apb_command(atcphy, 0x3);
+
+	dev_info(atcphy->dev, "DP-IN PCLK off: TX_DP_CTRL0=0x%08x PCLK_STAT=0x%08x CLKOUT_MASTER=0x%08x\n",
+		 readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+		 readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT),
+		 readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER));
+	atcphy->dp_link_rate = -1;
 	return 0;
 }
 
@@ -2192,6 +2262,8 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 			link_rate = ATCPHY_DP_LINK_RATE_HBR3;
 			break;
 		case 0:
+			if (atcphy_mode_is_tunnel(atcphy) && dpin_mode == 1)
+				return atcphy_dp_tunnel_disable_pclk(atcphy);
 			return 0;
 		default:
 			dev_err(atcphy->dev, "Unsupported link rate: %d\n", opts->link_rate);

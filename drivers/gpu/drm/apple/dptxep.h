@@ -63,7 +63,7 @@ struct dptx_port {
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 				 u8 atc, u8 die);
 int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
-		     u8 die);
+		     u8 die, u32 unk_field);
 int dptxport_request_display(struct apple_epic_service *service);
 int dptxport_release_display(struct apple_epic_service *service);
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd);

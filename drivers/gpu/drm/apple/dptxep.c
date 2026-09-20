@@ -12,9 +12,9 @@
  * Type-C PHY when the firmware activates a tunneled DP port, so the CIO DP IN
  * adapter has DP clocks before the firmware starts AUX traffic. 0 disables.
  */
-static int dpin_prime_rate = 5400;
+static int dpin_prime_rate; /* macOS programs the PHY only in SET_LINK_RATE */
 module_param(dpin_prime_rate, int, 0644);
-MODULE_PARM_DESC(dpin_prime_rate, "DP-IN: PHY DP link rate to prime on activate (0=off, default 5400)");
+MODULE_PARM_DESC(dpin_prime_rate, "DP-IN: PHY DP link rate to prime on activate (0=off, default 0)");
 
 #include "afk.h"
 #include "dcp.h"
@@ -108,11 +108,11 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 }
 
 int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
-		     u8 die)
+		     u8 die, u32 unk_field)
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	u32 unk_field = 0x0; // seen as 0x100 under some conditions
+	/* unk_field: 0 for DP alt mode (0x100 under some conditions), 0xb0101 for macOS DP-IN */
 	int ret;
 	u32 target = FIELD_PREP(DCPDPTX_REMOTE_PORT_CORE, core) |
 		     FIELD_PREP(DCPDPTX_REMOTE_PORT_ATC, atc) |
@@ -378,6 +378,10 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 	dptx->phy_ops.dp.set_rate = 0;
 	dptx->phy_ops.dp.set_voltages = 0;
 
+	/* macOS: DPTX_INACTIVE = 1, crossbar teardown, DPTX_INACTIVE = 0 (unplug only) */
+	if (service->ep->dcp->dp_tunnel)
+		dcp_dpin_xbar_down(service->ep->dcp);
+
 	return 0;
 }
 
@@ -449,6 +453,13 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 				return ret;
 		}
 
+		/* macOS: crossbar bringConnectionUp right after the PHY PCLK is up */
+		if (service->ep->dcp->dp_tunnel && link_rate) {
+			ret = dcp_dpin_xbar_up(service->ep->dcp);
+			if (ret)
+				return ret;
+		}
+
 		//if (dptx->phy_ops.dp.set_rate)
 		dptx->link_rate = dptx->pending_link_rate = link_rate;
 
@@ -469,8 +480,9 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
+	/* macOS answers 1 for the DP-IN port and then reports HPD itself */
 	reply->retcode = cpu_to_le32(0);
-	reply->supported = cpu_to_le32(0);
+	reply->supported = cpu_to_le32(service->ep->dcp->dp_tunnel ? 1 : 0);
 	return 0;
 }
 
@@ -494,12 +506,16 @@ dptxport_call_activate(struct apple_epic_service *service,
 		       void *reply, size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
-	const struct apple_dcp *dcp = service->ep->dcp;
+	struct apple_dcp *dcp = service->ep->dcp;
 
 	// TODO: hack, use phy_set_mode to select the correct DCP(EXT) input
 	// for standalone phy (i.e. not atc phy).
-	if (!dcp->typec_mux)
+	if (!dcp->typec_mux && !dcp->dp_tunnel)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+
+	/* macOS: crossbar mux select (its default value) and DPTX_INACTIVE = 0 here */
+	if (dcp->dp_tunnel)
+		dcp_dpin_activate(dcp);
 
 	if (dcp->dp_tunnel && dptx->atcphy && dpin_prime_rate) {
 		union phy_configure_opts opts = {};
@@ -525,9 +541,15 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 		       void *reply, size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
+	struct apple_dcp *dcp = service->ep->dcp;
 
-	/* deactivate phy */
-	phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+	if (dcp->dp_tunnel) {
+		/* the PHY stays in USB4/TBT mode; macOS only clears dpin 0x08 here */
+		dcp_dpin_deactivate(dcp);
+	} else {
+		/* deactivate phy */
+		phy_set_mode_ext(dptx->atcphy, PHY_MODE_INVALID, 0);
+	}
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -582,6 +604,13 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEACTIVATE:
 		return dptxport_call_deactivate(service, data, data_size,
 						reply, reply_size);
+	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+		if (service->ep->dcp->dp_tunnel) {
+			/* macOS echoes the request untouched (its first word stays 1) */
+			memcpy(reply, data, min(reply_size, data_size));
+			return 0;
+		}
+		fallthrough;
 	default:
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",

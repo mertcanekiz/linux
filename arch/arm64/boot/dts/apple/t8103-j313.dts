@@ -227,5 +227,6 @@
 	phy-names = "dp-phy";
 	mux-controls = <&atcphy1_xbar 1>, <&atcphy1_xbar 2>;
 	mux-control-names = "dp-xbar", "dp-xbar-dpin1";
+	apple,tbt-dpin = <&atc1_dpin0>, <&atc1_dpin1>;
 	mux-index = <0>;
 };

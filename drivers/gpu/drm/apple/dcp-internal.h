@@ -273,8 +273,19 @@ struct apple_dcp {
 	/* crossbar controls for DP IN 0 / DP IN 1 and the selected one */
 	struct mux_control *xbar_dpin[2];
 	u32 tunnel_dpin;
+	/* Apple "atc-dpin" DP IN bridge register blocks (DP IN 0 / 1) */
+	void __iomem *dpin_regs[2];
+	struct mutex dpin_lock;
+	bool dpin_active;
+	struct completion dpin_activate_completion;
 	int hdmi_hpd_irq;
 };
+
+/* DP-IN bridge + crossbar steps of the macOS bring-up, driven from dptxep.c */
+void dcp_dpin_activate(struct apple_dcp *dcp);
+void dcp_dpin_deactivate(struct apple_dcp *dcp);
+int dcp_dpin_xbar_up(struct apple_dcp *dcp);
+void dcp_dpin_xbar_down(struct apple_dcp *dcp);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 

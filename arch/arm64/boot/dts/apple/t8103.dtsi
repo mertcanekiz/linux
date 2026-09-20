@@ -1857,6 +1857,23 @@
 			power-domains = <&ps_atc1_usb>;
 		};
 
+		/*
+		 * Apple "atc-dpin" DP IN bridges (ADT atc1-dpin0/1): the display
+		 * crossbar outputs into the CIO DP IN adapters 5 and 6. No driver;
+		 * mapped by the DCP DP-IN bring-up experiment (apple,tbt-dpin).
+		 */
+		atc1_dpin0: dpin@501e50000 {
+			compatible = "apple,t8103-atc-dpin";
+			reg = <0x5 0x01e50000 0x0 0x4000>;
+			power-domains = <&ps_atc1_usb>;
+		};
+
+		atc1_dpin1: dpin@501e58000 {
+			compatible = "apple,t8103-atc-dpin";
+			reg = <0x5 0x01e58000 0x0 0x4000>;
+			power-domains = <&ps_atc1_usb>;
+		};
+
 		pcie0_dart_0: iommu@681008000 {
 			compatible = "apple,t8103-dart";
 			reg = <0x6 0x81008000 0x0 0x4000>;
